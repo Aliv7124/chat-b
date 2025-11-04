@@ -88,7 +88,6 @@ server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 */
 
-
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -141,43 +140,55 @@ const onlineUsers = new Map();
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
 
-  // When user comes online
+  // ✅ When user comes online
   socket.on("userOnline", async (userId) => {
     socket.userId = userId;
     onlineUsers.set(userId, socket.id);
+
     await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
     console.log(`✅ ${userId} is now online`);
+
+    // Broadcast both: user-specific + all online list
+    io.emit("userStatusChange", { userId, status: "online" });
     io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
   });
 
-  // Join room
+  // ✅ Join private chat room
   socket.on("joinRoom", ({ userId, receiverId }) => {
     const roomId = [userId, receiverId].sort().join("_");
     socket.join(roomId);
     console.log(`📥 ${userId} joined room ${roomId}`);
   });
 
-  // Typing
+  // ✅ Typing indicators
   socket.on("typing", (roomId) => socket.to(roomId).emit("typing", roomId));
   socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping", roomId));
 
-  // Sending message
+  // ✅ Send + receive messages in real time
   socket.on("sendMessage", (message) => {
     const roomId = [message.sender, message.receiver].sort().join("_");
     io.to(roomId).emit("receiveMessage", message);
   });
 
-  // Disconnect
+  // ✅ Handle disconnection
   socket.on("disconnect", async () => {
     console.log("🔴 User disconnected:", socket.id);
     if (socket.userId) {
       onlineUsers.delete(socket.userId);
       await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
       console.log(`⚫ ${socket.userId} went offline`);
+
+      // Notify all clients
+      io.emit("userStatusChange", {
+        userId: socket.userId,
+        status: "offline",
+        lastSeen: new Date(),
+      });
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
     }
   });
 });
 
+// ✅ Start Server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
