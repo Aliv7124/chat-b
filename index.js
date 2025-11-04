@@ -1,4 +1,4 @@
-
+/*
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -86,7 +86,9 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
-/*
+*/
+
+
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -110,7 +112,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: process.env.CLIENT_URL || "https://chat-nln7.vercel.app",
     methods: ["GET", "POST"],
   },
 });
@@ -133,77 +135,49 @@ app.use("/api/users", userRoutes);
 app.use("/api/chats", chatRoutes);
 app.use("/api/messages", messageRoutes);
 
-// ✅ SOCKET.IO EVENTS
+// ✅ SOCKET.IO EVENTS (Online Status + Last Seen)
+const onlineUsers = new Map();
+
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
 
-  // ===== User Online Tracking =====
+  // When user comes online
   socket.on("userOnline", async (userId) => {
     socket.userId = userId;
+    onlineUsers.set(userId, socket.id);
     await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
-    console.log(`✅ Updated last seen for user ${userId}`);
+    console.log(`✅ ${userId} is now online`);
+    io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
   });
 
-  // ===== Join Private Room =====
+  // Join room
   socket.on("joinRoom", ({ userId, receiverId }) => {
     const roomId = [userId, receiverId].sort().join("_");
     socket.join(roomId);
     console.log(`📥 ${userId} joined room ${roomId}`);
   });
 
-  // ===== Typing Indicators =====
-  socket.on("typing", (roomId) => {
-    socket.to(roomId).emit("typing", roomId);
-  });
+  // Typing
+  socket.on("typing", (roomId) => socket.to(roomId).emit("typing", roomId));
+  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping", roomId));
 
-  socket.on("stopTyping", (roomId) => {
-    socket.to(roomId).emit("stopTyping", roomId);
-  });
-
-  // ===== Send / Receive Messages =====
+  // Sending message
   socket.on("sendMessage", (message) => {
     const roomId = [message.sender, message.receiver].sort().join("_");
     io.to(roomId).emit("receiveMessage", message);
   });
 
-  // ====== 🔔 CALL FEATURE (WebRTC Signaling) ======
-
-  // Step 1: Caller starts call
-  socket.on("callUser", (data) => {
-    console.log(`📞 ${data.from} is calling ${data.to}`);
-    io.to(data.to).emit("incomingCall", {
-      signal: data.signal,
-      from: data.from,
-      name: data.name,
-    });
-  });
-
-  // Step 2: Callee answers
-  socket.on("answerCall", (data) => {
-    console.log(`✅ ${data.to} answered call from ${data.from}`);
-    io.to(data.to).emit("callAccepted", data.signal);
-  });
-
-  // Step 3: ICE Candidate Exchange
-  socket.on("iceCandidate", (data) => {
-    io.to(data.to).emit("iceCandidate", data.candidate);
-  });
-
-  // Step 4: Call Ended
-  socket.on("endCall", (data) => {
-    io.to(data.to).emit("callEnded");
-  });
-
-  // ===== Disconnect =====
+  // Disconnect
   socket.on("disconnect", async () => {
     console.log("🔴 User disconnected:", socket.id);
     if (socket.userId) {
+      onlineUsers.delete(socket.userId);
       await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
-      console.log(`⚫ Updated last seen for user ${socket.userId}`);
+      console.log(`⚫ ${socket.userId} went offline`);
+      io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
     }
   });
 });
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-*/
