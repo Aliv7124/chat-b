@@ -150,13 +150,13 @@ app.use("/api/users", userRoutes);
 app.use("/api/chats", chatRoutes);
 app.use("/api/messages", messageRoutes);
 
-// ✅ SOCKET.IO EVENTS (Online Status + Last Seen)
+// SOCKET.IO EVENTS (Online Status + Last Seen)
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
 
-  // Send all currently online users to the newly connected socket
+  // ✅ Emit current online users immediately
   socket.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
 
   // ✅ When user comes online
@@ -167,9 +167,14 @@ io.on("connection", (socket) => {
     await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
     console.log(`✅ ${userId} is now online`);
 
-    // Broadcast updates instantly
+    // Broadcast instantly
     io.emit("userStatusChange", { userId, status: "online" });
     io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
+  });
+
+  // ✅ Client can request online users anytime
+  socket.on("getOnlineUsers", () => {
+    socket.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
   });
 
   // ✅ Join private chat room
@@ -180,10 +185,10 @@ io.on("connection", (socket) => {
   });
 
   // ✅ Typing indicators
-  socket.on("typing", (roomId) => socket.to(roomId).emit("typing", roomId));
-  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping", roomId));
+  socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
+  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping"));
 
-  // ✅ Send + receive messages in real time
+  // ✅ Send + receive messages
   socket.on("sendMessage", (message) => {
     const roomId = [message.sender, message.receiver].sort().join("_");
     io.to(roomId).emit("receiveMessage", message);
@@ -207,6 +212,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// ✅ Start Server
+// Start Server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
