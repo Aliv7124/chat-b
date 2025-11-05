@@ -6,7 +6,6 @@ import mongoose from "mongoose";
 import dotenv from "dotenv";
 import cors from "cors";
 import path from "path";
-import { fileURLToPath } from "url";
 import User from "./models/User.js";
 
 // Routes
@@ -45,11 +44,14 @@ app.use("/api/users", userRoutes);
 app.use("/api/chats", chatRoutes);
 app.use("/api/messages", messageRoutes);
 
-// ✅ SOCKET.IO EVENTS (Online Status + Last Seen)
+// SOCKET.IO EVENTS (Online Status + Last Seen)
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
   console.log("🟢 User connected:", socket.id);
+
+  // ✅ Emit current online users immediately
+  socket.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
 
   // ✅ When user comes online
   socket.on("userOnline", async (userId) => {
@@ -59,9 +61,14 @@ io.on("connection", (socket) => {
     await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
     console.log(`✅ ${userId} is now online`);
 
-    // Broadcast both: user-specific + all online list
+    // Broadcast instantly
     io.emit("userStatusChange", { userId, status: "online" });
     io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
+  });
+
+  // ✅ Client can request online users anytime
+  socket.on("getOnlineUsers", () => {
+    socket.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
   });
 
   // ✅ Join private chat room
@@ -72,10 +79,10 @@ io.on("connection", (socket) => {
   });
 
   // ✅ Typing indicators
-  socket.on("typing", (roomId) => socket.to(roomId).emit("typing", roomId));
-  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping", roomId));
+  socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
+  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping"));
 
-  // ✅ Send + receive messages in real time
+  // ✅ Send + receive messages
   socket.on("sendMessage", (message) => {
     const roomId = [message.sender, message.receiver].sort().join("_");
     io.to(roomId).emit("receiveMessage", message);
@@ -89,7 +96,6 @@ io.on("connection", (socket) => {
       await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
       console.log(`⚫ ${socket.userId} went offline`);
 
-      // Notify all clients
       io.emit("userStatusChange", {
         userId: socket.userId,
         status: "offline",
@@ -100,10 +106,11 @@ io.on("connection", (socket) => {
   });
 });
 
-// ✅ Start Server
+// Start Server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 */
+
 
 import express from "express";
 import http from "http";
@@ -183,6 +190,43 @@ io.on("connection", (socket) => {
     socket.join(roomId);
     console.log(`📥 ${userId} joined room ${roomId}`);
   });
+   
+
+   // Inside io.on("connection", socket => { ... })
+  
+// Call request
+socket.on("callUser", ({ to, from, signalData }) => {
+  const targetSocketId = onlineUsers.get(to);
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("incomingCall", { from, signalData });
+  }
+});
+
+// Call accepted
+socket.on("acceptCall", ({ to, signalData }) => {
+  const targetSocketId = onlineUsers.get(to);
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("callAccepted", { signalData });
+  }
+});
+
+// Call rejected
+socket.on("rejectCall", ({ to }) => {
+  const targetSocketId = onlineUsers.get(to);
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("callRejected");
+  }
+});
+
+// End call
+socket.on("endCall", ({ to }) => {
+  const targetSocketId = onlineUsers.get(to);
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("callEnded");
+  }
+});
+
+   
 
   // ✅ Typing indicators
   socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
