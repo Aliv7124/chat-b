@@ -136,7 +136,6 @@ const io = new Server(server, {
     origin: process.env.CLIENT_URL || "https://chat-nln7.vercel.app",
     methods: ["GET", "POST"],
   },
-  transports: ["websocket", "polling"],
 });
 
 app.use(express.json({ limit: "50mb" }));
@@ -157,17 +156,11 @@ app.use("/api/messages", messageRoutes);
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
-  console.log("🟢 Connected:", socket.id);
-
-  socket.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
-
   socket.on("userOnline", async (userId) => {
     socket.userId = userId;
     onlineUsers.set(userId, socket.id);
     await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
-
     io.emit("userStatusChange", { userId, status: "online" });
-    io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
   });
 
   socket.on("joinRoom", ({ userId, receiverId }) => {
@@ -175,48 +168,60 @@ io.on("connection", (socket) => {
     socket.join(roomId);
   });
 
-  // =======================
-  // ✅ WEBRTC SIGNALING
-  // =======================
+  // =========================
+  // CALL FLOW (RING → ACCEPT → TIMER → CUT)
+  // =========================
 
-  socket.on("callUser", ({ to, from, offer }) => {
+  socket.on("call-user", ({ to, from, type }) => {
     const target = onlineUsers.get(to);
     if (target) {
-      io.to(target).emit("incomingCall", { from, offer });
+      io.to(target).emit("incoming-call", { from, type });
     }
   });
 
-  socket.on("answerCall", ({ to, answer }) => {
+  socket.on("accept-call", ({ to }) => {
     const target = onlineUsers.get(to);
     if (target) {
-      io.to(target).emit("callAnswered", { answer });
+      io.to(target).emit("call-accepted");
     }
   });
 
-  socket.on("iceCandidate", ({ to, candidate }) => {
+  socket.on("reject-call", ({ to }) => {
     const target = onlineUsers.get(to);
     if (target) {
-      io.to(target).emit("iceCandidate", { candidate });
+      io.to(target).emit("call-ended");
     }
   });
 
-  socket.on("endCall", ({ to }) => {
+  socket.on("end-call", ({ to }) => {
     const target = onlineUsers.get(to);
     if (target) {
-      io.to(target).emit("callEnded");
+      io.to(target).emit("call-ended");
     }
   });
 
-  socket.on("rejectCall", ({ to }) => {
+  // =========================
+  // WEBRTC SIGNALING
+  // =========================
+
+  socket.on("webrtc-offer", ({ to, offer }) => {
     const target = onlineUsers.get(to);
-    if (target) {
-      io.to(target).emit("callRejected");
-    }
+    if (target) io.to(target).emit("webrtc-offer", { offer });
   });
 
-  // =======================
-  // Chat & Typing
-  // =======================
+  socket.on("webrtc-answer", ({ to, answer }) => {
+    const target = onlineUsers.get(to);
+    if (target) io.to(target).emit("webrtc-answer", { answer });
+  });
+
+  socket.on("webrtc-ice", ({ to, candidate }) => {
+    const target = onlineUsers.get(to);
+    if (target) io.to(target).emit("webrtc-ice", { candidate });
+  });
+
+  // =========================
+  // CHAT
+  // =========================
 
   socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
   socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping"));
@@ -230,15 +235,12 @@ io.on("connection", (socket) => {
     if (socket.userId) {
       onlineUsers.delete(socket.userId);
       await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
-
       io.emit("userStatusChange", {
         userId: socket.userId,
         status: "offline",
         lastSeen: new Date(),
       });
-      io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
     }
-    console.log("🔴 Disconnected:", socket.id);
   });
 });
 
