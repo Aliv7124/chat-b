@@ -268,34 +268,36 @@ const onlineUsers = new Map();
 const activeCalls = new Map();
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log("🟢 User connected:", socket.id);
 
   // ================= ONLINE STATUS =================
   socket.on("user-online", async (userId) => {
     socket.userId = userId;
     onlineUsers.set(userId, socket.id);
-    await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
+
+    try {
+      await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
+    } catch (err) {
+      console.error(err);
+    }
 
     io.emit("user-status", { userId, status: "online" });
     io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
-    console.log(`✅ ${userId} is now online`);
   });
 
   socket.on("getOnlineUsers", () => {
     socket.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
   });
 
-  // ================= CHAT ROOM & TYPING =================
+  // ================= CHAT ROOM + TYPING =================
   socket.on("joinRoom", ({ userId, receiverId }) => {
     const roomId = [userId, receiverId].sort().join("_");
     socket.join(roomId);
-    console.log(`📥 ${userId} joined room ${roomId}`);
   });
 
   socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
   socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping"));
 
-  // ================= MESSAGES =================
   socket.on("sendMessage", (message) => {
     const roomId = [message.sender, message.receiver].sort().join("_");
     io.to(roomId).emit("receiveMessage", message);
@@ -307,14 +309,11 @@ io.on("connection", (socket) => {
       socket.emit("call-busy");
       return;
     }
-
     activeCalls.set(from, to);
     activeCalls.set(to, from);
 
     const target = onlineUsers.get(to);
-    if (target) {
-      io.to(target).emit("incoming-call", { from, type });
-    }
+    if (target) io.to(target).emit("incoming-call", { from, type });
   });
 
   socket.on("accept-call", ({ to }) => {
@@ -351,8 +350,6 @@ io.on("connection", (socket) => {
 
   // ================= DISCONNECT =================
   socket.on("disconnect", async () => {
-    console.log("🔴 User disconnected:", socket.id);
-
     const peer = activeCalls.get(socket.userId);
     if (peer) {
       const target = onlineUsers.get(peer);
@@ -363,10 +360,14 @@ io.on("connection", (socket) => {
     onlineUsers.delete(socket.userId);
 
     if (socket.userId) {
-      await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
+      try {
+        await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
+      } catch (err) {
+        console.error(err);
+      }
+
       io.emit("user-status", { userId: socket.userId, status: "offline", lastSeen: new Date() });
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
-      console.log(`⚫ ${socket.userId} went offline`);
     }
   });
 });
