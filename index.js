@@ -218,7 +218,6 @@ io.on("connection", (socket) => {
 server.listen(5000, () => console.log("Server running on 5000"));
 */
 
-
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -263,23 +262,20 @@ mongoose
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err));
 
+// ================= SOCKET STATE =================
+const onlineUsers = new Map(); // userId -> socketId
+const activeCalls = new Map(); // callerId -> receiverId
+
 // ================= SOCKET.IO =================
-const onlineUsers = new Map();
-const activeCalls = new Map();
-
 io.on("connection", (socket) => {
-  console.log("🟢 User connected:", socket.id);
+  console.log("🟢 Connected:", socket.id);
 
-  // ================= ONLINE STATUS =================
+  // ---------- USER ONLINE ----------
   socket.on("user-online", async (userId) => {
     socket.userId = userId;
     onlineUsers.set(userId, socket.id);
 
-    try {
-      await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
-    } catch (err) {
-      console.error(err);
-    }
+    await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
 
     io.emit("user-status", { userId, status: "online" });
     io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
@@ -289,7 +285,7 @@ io.on("connection", (socket) => {
     socket.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
   });
 
-  // ================= CHAT ROOM + TYPING =================
+  // ---------- CHAT ROOM ----------
   socket.on("joinRoom", ({ userId, receiverId }) => {
     const roomId = [userId, receiverId].sort().join("_");
     socket.join(roomId);
@@ -303,27 +299,31 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("receiveMessage", message);
   });
 
-  // ================= CALL LOGIC =================
-  socket.on("call-user", ({ from, to, type }) => {
-    if (activeCalls.has(to)) {
+  // ================= CALL SYSTEM =================
+
+  socket.on("call-user", ({ from, to }) => {
+    if (activeCalls.has(from) || activeCalls.has(to)) {
       socket.emit("call-busy");
       return;
     }
-    activeCalls.set(from, to);
-    activeCalls.set(to, from);
 
-    const target = onlineUsers.get(to);
-    if (target) io.to(target).emit("incoming-call", { from, type });
+    activeCalls.set(from, to);
+
+    const targetSocket = onlineUsers.get(to);
+    if (targetSocket) {
+      io.to(targetSocket).emit("incoming-call", { from });
+    }
   });
 
-  socket.on("accept-call", ({ to }) => {
-    const target = onlineUsers.get(to);
+  socket.on("accept-call", ({ from }) => {
+    const target = onlineUsers.get(from);
     if (target) io.to(target).emit("call-accepted");
   });
 
-  socket.on("reject-call", ({ to }) => {
-    const target = onlineUsers.get(to);
+  socket.on("reject-call", ({ from }) => {
+    const target = onlineUsers.get(from);
     if (target) io.to(target).emit("call-ended");
+    activeCalls.delete(from);
   });
 
   socket.on("webrtc-offer", ({ to, offer }) => {
@@ -344,29 +344,26 @@ io.on("connection", (socket) => {
   socket.on("end-call", ({ to }) => {
     const target = onlineUsers.get(to);
     if (target) io.to(target).emit("call-ended");
-    activeCalls.delete(to);
     activeCalls.delete(socket.userId);
+    activeCalls.delete(to);
   });
 
-  // ================= DISCONNECT =================
+  // ---------- DISCONNECT ----------
   socket.on("disconnect", async () => {
-    const peer = activeCalls.get(socket.userId);
-    if (peer) {
-      const target = onlineUsers.get(peer);
-      if (target) io.to(target).emit("call-ended");
-    }
+    const userId = socket.userId;
 
-    activeCalls.delete(socket.userId);
-    onlineUsers.delete(socket.userId);
+    if (userId) {
+      activeCalls.delete(userId);
+      onlineUsers.delete(userId);
 
-    if (socket.userId) {
-      try {
-        await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
-      } catch (err) {
-        console.error(err);
-      }
+      await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
 
-      io.emit("user-status", { userId: socket.userId, status: "offline", lastSeen: new Date() });
+      io.emit("user-status", {
+        userId,
+        status: "offline",
+        lastSeen: new Date(),
+      });
+
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
     }
   });
@@ -374,4 +371,6 @@ io.on("connection", (socket) => {
 
 // ================= START SERVER =================
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.listen(PORT, () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
