@@ -219,7 +219,6 @@ server.listen(5000, () => console.log("Server running on 5000"));
 */
 
 
- 
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -261,8 +260,8 @@ mongoose
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err));
 
-const onlineUsers = new Map();
-const activeCalls = new Map();
+const onlineUsers = new Map(); // userId -> socketId
+const activeCalls = new Map(); // userId -> partnerId (Bi-directional)
 
 io.on("connection", (socket) => {
   // ===== USER ONLINE =====
@@ -294,55 +293,74 @@ io.on("connection", (socket) => {
 
   // ===== CALL SYSTEM =====
   socket.on("call-user", ({ from, to, type }) => {
-    if (activeCalls.has(from) || activeCalls.has(to)) {
+    // Check if receiver is online and not already in a call
+    if (activeCalls.has(to) || activeCalls.has(from)) {
       socket.emit("call-busy");
       return;
     }
+    const targetSocket = onlineUsers.get(to);
+    if (targetSocket) {
+      io.to(targetSocket).emit("incoming-call", { from, type });
+    } else {
+      socket.emit("user-offline");
+    }
+  });
+
+  socket.on("accept-call", ({ to }) => {
+    const from = socket.userId;
+    // Link both users in activeCalls
     activeCalls.set(from, to);
-    const target = onlineUsers.get(to);
-    if (target) io.to(target).emit("incoming-call", { from, type });
+    activeCalls.set(to, from);
+
+    const targetSocket = onlineUsers.get(to);
+    if (targetSocket) io.to(targetSocket).emit("call-accepted");
   });
 
-  socket.on("accept-call", ({ from }) => {
-    const target = onlineUsers.get(from);
-    if (target) io.to(target).emit("call-accepted");
-  });
-
-  socket.on("reject-call", ({ from }) => {
-    const target = onlineUsers.get(from);
-    if (target) io.to(target).emit("call-ended");
-    activeCalls.delete(from);
+  socket.on("reject-call", ({ to }) => {
+    const targetSocket = onlineUsers.get(to);
+    if (targetSocket) io.to(targetSocket).emit("call-rejected");
   });
 
   // ===== WEBRTC SIGNALING =====
   socket.on("webrtc-offer", ({ to, offer }) => {
     const target = onlineUsers.get(to);
-    if (target) io.to(target).emit("webrtc-offer", { offer });
+    if (target) io.to(target).emit("webrtc-offer", { offer, from: socket.userId });
   });
 
   socket.on("webrtc-answer", ({ to, answer }) => {
     const target = onlineUsers.get(to);
-    if (target) io.to(target).emit("webrtc-answer", { answer });
+    if (target) io.to(target).emit("webrtc-answer", { answer, from: socket.userId });
   });
 
   socket.on("webrtc-ice", ({ to, candidate }) => {
     const target = onlineUsers.get(to);
-    if (target) io.to(target).emit("webrtc-ice", { candidate });
+    if (target) io.to(target).emit("webrtc-ice", { candidate, from: socket.userId });
   });
 
   socket.on("end-call", ({ to }) => {
-    const target = onlineUsers.get(to);
-    if (target) io.to(target).emit("call-ended");
+    // Clean up both users from activeCalls
     activeCalls.delete(socket.userId);
     activeCalls.delete(to);
+
+    const target = onlineUsers.get(to);
+    if (target) io.to(target).emit("call-ended");
   });
 
   // ===== DISCONNECT =====
   socket.on("disconnect", async () => {
     const userId = socket.userId;
     if (userId) {
+      // If user was in a call, notify the partner
+      const partnerId = activeCalls.get(userId);
+      if (partnerId) {
+        const partnerSocket = onlineUsers.get(partnerId);
+        if (partnerSocket) io.to(partnerSocket).emit("call-ended");
+        activeCalls.delete(partnerId);
+      }
+
       onlineUsers.delete(userId);
       activeCalls.delete(userId);
+      
       await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
       io.emit("user-status", { userId, status: "offline", lastSeen: new Date() });
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
