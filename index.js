@@ -191,7 +191,6 @@ server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 
 
-
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -238,17 +237,23 @@ mongoose.connect(process.env.MONGO_URI)
 
 const onlineUsers = new Map(); // userId -> socketId
 
+
+
 io.on("connection", (socket) => {
   
-  // 1. User Presence
-  socket.on("user-online", async (userId) => {
+  // 1. USER PRESENCE
+  socket.on("userOnline", async (userId) => {
     if (!userId) return;
     socket.userId = String(userId);
     onlineUsers.set(String(userId), socket.id);
     
-    io.emit("userStatusChange", { userId: socket.userId, status: "online" });
-    io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
+    // Update DB so the User Route shows them as online
+    await User.findByIdAndUpdate(userId, { isOnline: true });
+    
+    // Notify all clients immediately
+    io.emit("userStatusUpdate", { userId: socket.userId, status: "online" });
 
+    // Mark pending messages as 'delivered'
     try {
       await Message.updateMany(
         { receiver: socket.userId, status: "sent" },
@@ -257,59 +262,58 @@ io.on("connection", (socket) => {
     } catch (err) { console.error(err); }
   });
 
-  // 2. Room Logic
+  // 2. ROOM LOGIC
   socket.on("joinChat", (roomId) => {
     socket.join(roomId);
   });
 
-  // 3. Real-Time Messaging & Ticks
+  // 3. REAL-TIME MESSAGING
   socket.on("sendMessage", async (message) => {
     const roomId = [String(message.sender), String(message.receiver)].sort().join("_");
     const receiverSocket = onlineUsers.get(String(message.receiver));
 
+    // Send to the room so other tabs of the same user also get it
+    socket.to(roomId).emit("receiveMessage", message);
+    
     if (receiverSocket) {
-      // ✅ Update DB to delivered
+      // If receiver is online, mark as delivered in DB
       await Message.findByIdAndUpdate(message._id, { status: "delivered" });
-      
-      // ✅ Send to receiver
-      io.to(receiverSocket).emit("receiveMessage", { ...message, status: "delivered" });
-      
-      // ✅ Notify sender's other tabs/devices
-      socket.emit("messageStatusUpdate", { messageId: message._id, status: "delivered" });
+      // Notify sender to show double grey ticks
+      socket.emit("messageStatusUpdate", { messageIds: [message._id], status: "delivered" });
     }
   });
 
-  // 4. Blue Tick (Seen) Logic
-  socket.on("messageSeen", async ({ messageId, senderId }) => {
+  // 4. BLUE TICK (SEEN) LOGIC
+  socket.on("markAsSeen", async ({ messageIds, senderId, receiverId }) => {
     try {
-      await Message.findByIdAndUpdate(messageId, { status: "seen" });
+      await Message.updateMany(
+        { _id: { $in: messageIds } },
+        { $set: { status: "seen" } }
+      );
+
       const senderSocket = onlineUsers.get(String(senderId));
-      
       if (senderSocket) {
-        // ✅ Tell the sender to turn the ticks BLUE
-        io.to(senderSocket).emit("messageStatusUpdate", { messageId, status: "seen" });
+        // Send back to the sender so their ticks turn blue
+        io.to(senderSocket).emit("messageStatusUpdate", { messageIds, status: "seen" });
       }
     } catch (err) { console.error(err); }
   });
 
-  // 5. Typing Indicators
-  socket.on("typing", ({ roomId }) => {
-    // ✅ Send to everyone in room EXCEPT the sender
-    socket.to(roomId).emit("typing", { senderId: socket.userId });
+  // 5. TYPING INDICATORS
+  socket.on("typing", ({ roomId, senderId }) => {
+    socket.to(roomId).emit("typing", { senderId });
   });
 
-  socket.on("stopTyping", ({ roomId }) => {
-    socket.to(roomId).emit("stopTyping", { senderId: socket.userId });
+  socket.on("stopTyping", ({ roomId, senderId }) => {
+    socket.to(roomId).emit("stopTyping", { senderId });
   });
 
-  // 6. Delete Message (Vanish)
-  socket.on("deleteMessage", ({ messageId, receiverId }) => {
-    const roomId = [String(socket.userId), String(receiverId)].sort().join("_");
-    // ✅ Use io.to(roomId) so it vanishes for BOTH users simultaneously
+  // 6. DELETE MESSAGE
+  socket.on("deleteMessage", ({ messageId, roomId }) => {
     io.to(roomId).emit("messageDeleted", messageId);
   });
 
-  // 7. Signaling (WebRTC)
+  // 7. SIGNALING (WebRTC)
   socket.on("call-user", ({ from, to, type }) => {
     const targetSocket = onlineUsers.get(String(to));
     if (targetSocket) io.to(targetSocket).emit("incoming-call", { from, type });
@@ -330,16 +334,19 @@ io.on("connection", (socket) => {
     if (target) io.to(target).emit("webrtc-ice", { candidate, from: socket.userId });
   });
 
+  // 8. DISCONNECT
   socket.on("disconnect", async () => {
     if (socket.userId) {
       onlineUsers.delete(socket.userId);
       const lastSeen = new Date();
-      await User.findByIdAndUpdate(socket.userId, { lastSeen });
-      io.emit("userStatusChange", { userId: socket.userId, status: "offline", lastSeen });
-      io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
+      // Crucial: Set isOnline to false in DB
+      await User.findByIdAndUpdate(socket.userId, { isOnline: false, lastSeen });
+      
+      // Send the date object so the frontend can display "Last seen at..."
+      io.emit("userStatusUpdate", { userId: socket.userId, status: lastSeen });
     }
   });
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
