@@ -1,201 +1,4 @@
 /*
-import express from "express";
-import http from "http";
-import { Server } from "socket.io";
-import mongoose from "mongoose";
-import dotenv from "dotenv";
-import cors from "cors";
-import path from "path";
-import User from "./models/User.js";
-
-// Route Imports
-import authRoutes from "./routes/auth.js";
-import userRoutes from "./routes/user.js";
-import chatRoutes from "./routes/chat.js";
-import messageRoutes from "./routes/message.js";
-
-dotenv.config();
-
-const app = express();
-const server = http.createServer(app);
-
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
-    methods: ["GET", "POST"],
-  },
-});
-
-// Middleware
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
-app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
-
-// API Routes
-app.use("/api/auth", authRoutes);
-app.use("/api/users", userRoutes);
-app.use("/api/chats", chatRoutes);
-app.use("/api/messages", messageRoutes);
-
-// Database Connection
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => console.log("✅ MongoDB Connected"))
-  .catch((err) => console.error("❌ MongoDB Error:", err));
-
-// State Management
-const onlineUsers = new Map(); // userId -> socketId
-const activeCalls = new Map(); // userId -> partnerId
-
-io.on("connection", (socket) => {
-  console.log("New connection:", socket.id);
-
-  // ===== USER PRESENCE =====
-  socket.on("user-online", async (userId) => {
-    socket.userId = userId;
-    onlineUsers.set(userId, socket.id);
-    
-    
-
-    // Update DB status
-    await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
-    
-    // Broadcast status to others
-    io.emit("user-status", { userId, status: "online" });
-    io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
-  });
-
-  // ===== CHAT LOGIC =====
-  socket.on("joinRoom", ({ userId, receiverId }) => {
-    const roomId = [userId, receiverId].sort().join("_");
-    socket.join(roomId);
-  });
-
-  socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
-  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping"));
-
-  socket.on("sendMessage", (message) => {
-    const roomId = [message.sender, message.receiver].sort().join("_");
-    io.to(roomId).emit("receiveMessage", message);
-  });
-
-   
-
-// 5. DELETE MESSAGE REAL-TIME RELAY
-socket.on("deleteMessage", ({ msgId, roomId }) => {
-  // We use .to(roomId) to tell everyone in that specific chat 
-  // to remove that message ID from their local state.
-  io.to(roomId).emit("messageDeleted", msgId);
-});
-
-
-
-  // ===== CALL SYSTEM (THE HANDSHAKE) =====
-
-  // 1. Initial Offer to Call
-  socket.on("call-user", ({ from, to, type }) => {
-    if (activeCalls.has(to)) {
-      socket.emit("call-busy");
-      return;
-    }
-    const targetSocket = onlineUsers.get(to);
-    if (targetSocket) {
-      // Send the incoming call notification to the Callee
-      io.to(targetSocket).emit("incoming-call", { from, type });
-    } else {
-      socket.emit("user-offline");
-    }
-  });
-
-  // 2. Callee Accepts the Call
-  socket.on("accept-call", ({ to }) => {
-    const from = socket.userId;
-    // Track that these two are now in a call
-    activeCalls.set(from, to);
-    activeCalls.set(to, from);
-
-    const callerSocket = onlineUsers.get(to);
-    if (callerSocket) {
-      // Notify the Caller that they can now start WebRTC negotiation
-      io.to(callerSocket).emit("call-accepted", { from });
-    }
-  });
-
-  // 3. Callee Rejects the Call
-  socket.on("reject-call", ({ to }) => {
-    const callerSocket = onlineUsers.get(to);
-    if (callerSocket) {
-      io.to(callerSocket).emit("call-rejected");
-    }
-  });
-
-  // ===== WEBRTC SIGNALING (PASS-THROUGH) =====
-
-  socket.on("webrtc-offer", ({ to, offer }) => {
-    const target = onlineUsers.get(to);
-    if (target) {
-      io.to(target).emit("webrtc-offer", { offer, from: socket.userId });
-    }
-  });
-
-  socket.on("webrtc-answer", ({ to, answer }) => {
-    const target = onlineUsers.get(to);
-    if (target) {
-      io.to(target).emit("webrtc-answer", { answer, from: socket.userId });
-    }
-  });
-
-  socket.on("webrtc-ice", ({ to, candidate }) => {
-    const target = onlineUsers.get(to);
-    if (target) {
-      io.to(target).emit("webrtc-ice", { candidate, from: socket.userId });
-    }
-  });
-
-  // 4. End Call
-  socket.on("end-call", ({ to }) => {
-    activeCalls.delete(socket.userId);
-    activeCalls.delete(to);
-
-    const target = onlineUsers.get(to);
-    if (target) {
-      io.to(target).emit("call-ended");
-    }
-  });
-
-  // ===== DISCONNECT LOGIC =====
-  socket.on("disconnect", async () => {
-    const userId = socket.userId;
-    if (userId) {
-      // If user was in a call, notify their partner immediately
-      const partnerId = activeCalls.get(userId);
-      if (partnerId) {
-        const partnerSocket = onlineUsers.get(partnerId);
-        if (partnerSocket) {
-          io.to(partnerSocket).emit("call-ended");
-        }
-        activeCalls.delete(partnerId);
-      }
-
-      onlineUsers.delete(userId);
-      activeCalls.delete(userId);
-      
-      const lastSeenDate = new Date();
-      await User.findByIdAndUpdate(userId, { lastSeen: lastSeenDate });
-      
-      io.emit("user-status", { userId, status: "offline", lastSeen: lastSeenDate });
-      io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
-    }
-    console.log("User disconnected:", socket.id);
-  });
-});
-
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-*/
-
 
 import express from "express";
 import http from "http";
@@ -375,6 +178,229 @@ io.on("connection", (socket) => {
       const lastSeenDate = new Date();
       await User.findByIdAndUpdate(userId, { lastSeen: lastSeenDate });
       
+      io.emit("user-status", { userId, status: "offline", lastSeen: lastSeenDate });
+      io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
+    }
+    console.log("User disconnected:", socket.id);
+  });
+});
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+*/
+
+   
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import mongoose from "mongoose";
+import dotenv from "dotenv";
+import cors from "cors";
+import path from "path";
+
+// Models
+import User from "./models/User.js";
+import Message from "./models/Message.js";
+
+// Routes
+import authRoutes from "./routes/auth.js";
+import userRoutes from "./routes/user.js";
+import chatRoutes from "./routes/chat.js";
+import messageRoutes from "./routes/message.js";
+
+dotenv.config();
+
+const app = express();
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    methods: ["GET", "POST"],
+  },
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+
+// API Routes
+app.use("/api/auth", authRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/chats", chatRoutes);
+app.use("/api/messages", messageRoutes);
+
+// Database Connection
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(async () => {
+    console.log("✅ MongoDB Connected");
+
+    // --- ADD THIS TEMPORARILY TO FIX PREVIOUS MESSAGES ---
+    const result = await Message.updateMany(
+      { status: { $ne: "seen" } }, // Find messages that are NOT 'seen'
+      { $set: { status: "seen" } }   // Force them to 'seen'
+    );
+    console.log(`Updated ${result.modifiedCount} old messages to 'seen' status.`);
+    // ---------------------------------------------------
+  })
+  .catch((err) => console.error("❌ MongoDB Error:", err));
+
+// State Management
+const onlineUsers = new Map(); // userId (String) -> socketId
+const activeCalls = new Map(); // userId -> partnerId
+
+io.on("connection", (socket) => {
+  console.log("New connection:", socket.id);
+
+  // ===== 1. USER PRESENCE =====
+  socket.on("user-online", async (userId) => {
+    if (!userId) return;
+    const stringId = String(userId); // Ensure ID is a string for the Map
+    socket.userId = stringId;
+    onlineUsers.set(stringId, socket.id);
+    
+    try {
+      await User.findByIdAndUpdate(stringId, { lastSeen: new Date() });
+      io.emit("user-status", { userId: stringId, status: "online" });
+      io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
+    } catch (err) {
+      console.error("Status Update Error:", err);
+    }
+  });
+
+  // ===== 2. ROOM LOGIC =====
+  socket.on("joinRoom", ({ userId, receiverId }) => {
+    const roomId = [String(userId), String(receiverId)].sort().join("_");
+    socket.join(roomId);
+  });
+
+  // ===== 3. CHAT MESSAGING (WITH TICK LOGIC) =====
+  socket.on("sendMessage", async (message) => {
+    const roomId = [String(message.sender), String(message.receiver)].sort().join("_");
+    const receiverId = String(message.receiver);
+    const targetSocket = onlineUsers.get(receiverId);
+
+    let updatedStatus = "sent"; // Default: Single Tick
+
+    if (targetSocket) {
+      // If receiver is online, update to 'delivered' (Double Tick)
+      updatedStatus = "delivered";
+      try {
+        await Message.findByIdAndUpdate(message._id, { status: "delivered" });
+      } catch (err) {
+        console.error("Error updating message status:", err);
+      }
+      
+      // Send to receiver immediately
+      io.to(targetSocket).emit("receiveMessage", { ...message, status: "delivered" });
+    }
+
+    // Emit back to sender so their UI updates to Double Tick
+    socket.emit("message-status-updated", { 
+      messageId: message._id, 
+      status: updatedStatus 
+    });
+    
+    // Broadcast to the room (other instances/tabs of the users)
+    socket.to(roomId).emit("receiveMessage", { ...message, status: updatedStatus });
+  });
+
+  // ===== 4. BLUE TICK LOGIC (MARK AS SEEN) =====
+  socket.on("mark-as-seen", async ({ messageIds, senderId, userId }) => {
+    try {
+      await Message.updateMany(
+        { _id: { $in: messageIds } },
+        { $set: { status: "seen" } }
+      );
+
+      const senderSocket = onlineUsers.get(String(senderId));
+      if (senderSocket) {
+        io.to(senderSocket).emit("messages-seen-update", { 
+          messageIds, 
+          receiverId: String(userId) 
+        });
+      }
+    } catch (err) {
+      console.error("Mark as seen error:", err);
+    }
+  });
+
+  // ===== 5. TYPING & DELETE =====
+  socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
+  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping"));
+
+  socket.on("deleteMessage", ({ messageId, receiverId }) => {
+    const roomId = [String(socket.userId), String(receiverId)].sort().join("_");
+    io.to(roomId).emit("messageDeleted", { messageId });
+  });
+
+  // ===== 6. CALL SYSTEM & WEBRTC =====
+  socket.on("call-user", ({ from, to, type }) => {
+    if (activeCalls.has(String(to))) {
+      socket.emit("call-busy");
+      return;
+    }
+    const targetSocket = onlineUsers.get(String(to));
+    if (targetSocket) {
+      io.to(targetSocket).emit("incoming-call", { from, type });
+    } else {
+      socket.emit("user-offline");
+    }
+  });
+
+  socket.on("accept-call", ({ to }) => {
+    const from = String(socket.userId);
+    const targetId = String(to);
+    activeCalls.set(from, targetId);
+    activeCalls.set(targetId, from);
+    const callerSocket = onlineUsers.get(targetId);
+    if (callerSocket) io.to(callerSocket).emit("call-accepted", { from });
+  });
+
+  socket.on("reject-call", ({ to }) => {
+    const callerSocket = onlineUsers.get(String(to));
+    if (callerSocket) io.to(callerSocket).emit("call-rejected");
+  });
+
+  socket.on("webrtc-offer", ({ to, offer }) => {
+    const target = onlineUsers.get(String(to));
+    if (target) io.to(target).emit("webrtc-offer", { offer, from: socket.userId });
+  });
+
+  socket.on("webrtc-answer", ({ to, answer }) => {
+    const target = onlineUsers.get(String(to));
+    if (target) io.to(target).emit("webrtc-answer", { answer, from: socket.userId });
+  });
+
+  socket.on("webrtc-ice", ({ to, candidate }) => {
+    const target = onlineUsers.get(String(to));
+    if (target) io.to(target).emit("webrtc-ice", { candidate, from: socket.userId });
+  });
+
+  socket.on("end-call", ({ to }) => {
+    activeCalls.delete(String(socket.userId));
+    activeCalls.delete(String(to));
+    const target = onlineUsers.get(String(to));
+    if (target) io.to(target).emit("call-ended");
+  });
+
+  // ===== 7. DISCONNECT =====
+  socket.on("disconnect", async () => {
+    const userId = socket.userId;
+    if (userId) {
+      const partnerId = activeCalls.get(userId);
+      if (partnerId) {
+        const partnerSocket = onlineUsers.get(partnerId);
+        if (partnerSocket) io.to(partnerSocket).emit("call-ended");
+        activeCalls.delete(partnerId);
+      }
+      onlineUsers.delete(userId);
+      activeCalls.delete(userId);
+      const lastSeenDate = new Date();
+      await User.findByIdAndUpdate(userId, { lastSeen: lastSeenDate });
       io.emit("user-status", { userId, status: "offline", lastSeen: lastSeenDate });
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
     }
