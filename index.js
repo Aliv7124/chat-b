@@ -191,7 +191,6 @@ server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 
 
-
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -240,13 +239,13 @@ mongoose
   .then(async () => {
     console.log("✅ MongoDB Connected");
 
-    // Fix legacy messages without status or stuck in 'sent'
+    // Fix legacy messages without status or stuck in 'sent' (Run once on startup)
     const result = await Message.updateMany(
-      { status: { $ne: "seen" } }, 
-      { $set: { status: "seen" } } 
+      { status: { $exists: false } }, 
+      { $set: { status: "sent" } } 
     );
     if(result.modifiedCount > 0) {
-        console.log(`🧹 Cleaned up ${result.modifiedCount} old messages to 'seen' status.`);
+        console.log(`🧹 Cleaned up ${result.modifiedCount} legacy messages.`);
     }
   })
   .catch((err) => console.error("❌ MongoDB Error:", err));
@@ -258,7 +257,7 @@ const activeCalls = new Map(); // userId -> partnerId
 io.on("connection", (socket) => {
   console.log("New connection:", socket.id);
 
-  // ===== 1. USER PRESENCE =====
+  // ===== 1. USER PRESENCE & DELIVERY CATCH-UP =====
   socket.on("user-online", async (userId) => {
     if (!userId) return;
     const stringId = String(userId);
@@ -266,11 +265,40 @@ io.on("connection", (socket) => {
     onlineUsers.set(stringId, socket.id);
     
     try {
+      // Update user status to online
       await User.findByIdAndUpdate(stringId, { lastSeen: new Date() });
       io.emit("user-status", { userId: stringId, status: "online" });
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
+
+      // --- FIX: DELIVERY CATCH-UP ---
+      // Find all messages sent TO this user that are currently only 'sent'
+      const pendingMessages = await Message.find({ 
+        receiver: stringId, 
+        status: "sent" 
+      });
+
+      if (pendingMessages.length > 0) {
+        const messageIds = pendingMessages.map(m => m._id);
+        
+        // Mark them as delivered in DB
+        await Message.updateMany(
+          { _id: { $in: messageIds } },
+          { $set: { status: "delivered" } }
+        );
+
+        // Notify each sender that their message is now delivered (Double Tick)
+        pendingMessages.forEach(msg => {
+          const senderSocket = onlineUsers.get(String(msg.sender));
+          if (senderSocket) {
+            io.to(senderSocket).emit("message-status-updated", { 
+              messageId: msg._id, 
+              status: "delivered" 
+            });
+          }
+        });
+      }
     } catch (err) {
-      console.error("Status Update Error:", err);
+      console.error("Status/Delivery Update Error:", err);
     }
   });
 
@@ -289,7 +317,7 @@ io.on("connection", (socket) => {
     let updatedStatus = "sent";
 
     if (targetSocket) {
-      // Receiver is online -> Double Tick (delivered)
+      // If receiver is online right now -> Mark as delivered immediately
       updatedStatus = "delivered";
       try {
         await Message.findByIdAndUpdate(message._id, { status: "delivered" });
@@ -297,35 +325,34 @@ io.on("connection", (socket) => {
         console.error("Error updating status to delivered:", err);
       }
       
-      // Emit to receiver
+      // Send to receiver
       io.to(targetSocket).emit("receiveMessage", { ...message, status: "delivered" });
     }
 
-    // Emit back to sender
+    // Update the sender's UI (1 tick -> 2 ticks)
     socket.emit("message-status-updated", { 
       messageId: message._id, 
       status: updatedStatus 
     });
     
-    // Broadcast to other devices of the same user in that room
+    // Broadcast to the room
     socket.to(roomId).emit("receiveMessage", { ...message, status: updatedStatus });
   });
 
-  // ===== 4. MARK AS SEEN (BLUE/CYAN TICK LOGIC) =====
+  // ===== 4. MARK AS SEEN (BLUE TICK LOGIC) =====
   socket.on("mark-as-seen", async ({ messageIds, senderId, userId }) => {
     try {
-      // Update DB
       await Message.updateMany(
         { _id: { $in: messageIds } },
         { $set: { status: "seen" } }
       );
 
-      // Find the person who SENT the messages (the one who needs to see blue ticks)
       const senderSocket = onlineUsers.get(String(senderId));
       if (senderSocket) {
+        // Notify sender to turn ticks blue
         io.to(senderSocket).emit("messages-seen-update", { 
           messageIds, 
-          receiverId: String(userId) // The person who "saw" the messages
+          receiverId: String(userId) 
         });
       }
     } catch (err) {
