@@ -191,6 +191,7 @@ server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 
 
+
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -206,7 +207,6 @@ import Message from "./models/Message.js";
 // Routes
 import authRoutes from "./routes/auth.js";
 import userRoutes from "./routes/user.js";
-import chatRoutes from "./routes/chat.js";
 import messageRoutes from "./routes/message.js";
 
 dotenv.config();
@@ -230,7 +230,6 @@ app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 // API Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
-app.use("/api/chats", chatRoutes);
 app.use("/api/messages", messageRoutes);
 
 // Database Connection
@@ -238,15 +237,11 @@ mongoose
   .connect(process.env.MONGO_URI)
   .then(async () => {
     console.log("✅ MongoDB Connected");
-
     // Clean up legacy messages: Ensure everything has at least a 'sent' status
-    const result = await Message.updateMany(
+    await Message.updateMany(
       { status: { $exists: false } }, 
       { $set: { status: "sent" } } 
     );
-    if(result.modifiedCount > 0) {
-        console.log(`🧹 Cleaned up ${result.modifiedCount} legacy messages.`);
-    }
   })
   .catch((err) => console.error("❌ MongoDB Error:", err));
 
@@ -257,7 +252,7 @@ const activeCalls = new Map(); // userId -> partnerId
 io.on("connection", (socket) => {
   console.log("New connection:", socket.id);
 
-  // ===== 1. USER PRESENCE & BULK DELIVERY CATCH-UP =====
+  // ===== 1. USER PRESENCE & STATUS =====
   socket.on("user-online", async (userId) => {
     if (!userId) return;
     const stringId = String(userId);
@@ -265,124 +260,81 @@ io.on("connection", (socket) => {
     onlineUsers.set(stringId, socket.id);
     
     try {
-      // Update user status to online in DB
       await User.findByIdAndUpdate(stringId, { lastSeen: new Date() });
-      io.emit("user-status", { userId: stringId, status: "online" });
+      io.emit("userStatusChange", { userId: stringId, status: "online" });
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
 
-      // --- FIX: BULK DELIVERY LOGIC ---
-      // 1. Find all messages sent TO this user that are currently only 'sent'
-      const pendingMessages = await Message.find({ 
-        receiver: stringId, 
-        status: "sent" 
-      });
-
+      // Bulk update 'sent' to 'delivered' for the user coming online
+      const pendingMessages = await Message.find({ receiver: stringId, status: "sent" });
       if (pendingMessages.length > 0) {
-        const messageIds = pendingMessages.map(m => m._id);
+        await Message.updateMany({ _id: { $in: pendingMessages.map(m => m._id) } }, { $set: { status: "delivered" } });
         
-        // 2. Update DB to 'delivered' status
-        await Message.updateMany(
-          { _id: { $in: messageIds } },
-          { $set: { status: "delivered" } }
-        );
-
-        // 3. Group by Sender to notify them in bulk
-        const groupedBySender = pendingMessages.reduce((acc, msg) => {
-          const sId = String(msg.sender);
-          if (!acc[sId]) acc[sId] = [];
-          acc[sId].push(msg._id);
-          return acc;
-        }, {});
-
-        // 4. Emit the bulk update to each online sender
-        Object.keys(groupedBySender).forEach(senderId => {
-          const senderSocket = onlineUsers.get(senderId);
+        // Notify senders that their messages were delivered
+        pendingMessages.forEach(msg => {
+          const senderSocket = onlineUsers.get(String(msg.sender));
           if (senderSocket) {
-            io.to(senderSocket).emit("messages-delivered-bulk", { 
-              messageIds: groupedBySender[senderId], 
-              status: "delivered" 
-            });
+            io.to(senderSocket).emit("messageStatusUpdate", { messageId: msg._id, status: "delivered" });
           }
         });
       }
-    } catch (err) {
-      console.error("Status/Delivery Update Error:", err);
-    }
+    } catch (err) { console.error(err); }
   });
 
-  // ===== 2. ROOM LOGIC =====
-  socket.on("joinRoom", ({ userId, receiverId }) => {
-    const roomId = [String(userId), String(receiverId)].sort().join("_");
+  // ===== 2. ROOM JOINING =====
+  // Matches ChatWindow.jsx: socket.emit("joinChat", roomId)
+  socket.on("joinChat", (roomId) => {
     socket.join(roomId);
+    console.log(`User ${socket.userId} joined room: ${roomId}`);
   });
 
-  // ===== 3. CHAT MESSAGING =====
+  // ===== 3. MESSAGING =====
   socket.on("sendMessage", async (message) => {
     const roomId = [String(message.sender), String(message.receiver)].sort().join("_");
     const receiverId = String(message.receiver);
     const targetSocket = onlineUsers.get(receiverId);
 
     let updatedStatus = "sent";
-
     if (targetSocket) {
-      // Receiver is online -> Move to delivered instantly
       updatedStatus = "delivered";
-      try {
-        await Message.findByIdAndUpdate(message._id, { status: "delivered" });
-      } catch (err) {
-        console.error("Error updating status to delivered:", err);
-      }
-      
-      // Emit to receiver
+      await Message.findByIdAndUpdate(message._id, { status: "delivered" });
       io.to(targetSocket).emit("receiveMessage", { ...message, status: "delivered" });
     }
 
-    // Emit status back to sender's UI
-    socket.emit("message-status-updated", { 
-      messageId: message._id, 
-      status: updatedStatus 
-    });
-    
-    // Broadcast to other devices of the same user in that room
+    // Update sender's checkmarks
+    socket.emit("messageStatusUpdate", { messageId: message._id, status: updatedStatus });
+    // Update other devices of the sender
     socket.to(roomId).emit("receiveMessage", { ...message, status: updatedStatus });
   });
 
-  // ===== 4. MARK AS SEEN (BLUE TICK LOGIC) =====
-  socket.on("mark-as-seen", async ({ messageIds, senderId, userId }) => {
+  // ===== 4. SEEN / BLUE TICK LOGIC =====
+  socket.on("messageSeen", async ({ messageId, senderId }) => {
     try {
-      await Message.updateMany(
-        { _id: { $in: messageIds } },
-        { $set: { status: "seen" } }
-      );
-
+      await Message.findByIdAndUpdate(messageId, { status: "seen" });
       const senderSocket = onlineUsers.get(String(senderId));
       if (senderSocket) {
-        io.to(senderSocket).emit("messages-seen-update", { 
-          messageIds, 
-          receiverId: String(userId) 
-        });
+        io.to(senderSocket).emit("messageStatusUpdate", { messageId, status: "seen" });
       }
-    } catch (err) {
-      console.error("Mark as seen error:", err);
-    }
+    } catch (err) { console.error(err); }
   });
 
   // ===== 5. TYPING & DELETE =====
-  socket.on("typing", (roomId) => socket.to(roomId).emit("typing"));
-  socket.on("stopTyping", (roomId) => socket.to(roomId).emit("stopTyping"));
+  socket.on("typing", ({ roomId }) => {
+    socket.to(roomId).emit("typing", { senderId: socket.userId });
+  });
+
+  socket.on("stopTyping", ({ roomId }) => {
+    socket.to(roomId).emit("stopTyping", { senderId: socket.userId });
+  });
 
   socket.on("deleteMessage", ({ messageId, receiverId }) => {
     const roomId = [String(socket.userId), String(receiverId)].sort().join("_");
-    io.to(roomId).emit("messageDeleted", { messageId });
+    io.to(roomId).emit("messageDeleted", messageId);
   });
 
   // ===== 6. CALL SYSTEM =====
   socket.on("call-user", ({ from, to, type }) => {
-    if (activeCalls.has(String(to))) {
-      socket.emit("call-busy");
-      return;
-    }
     const targetSocket = onlineUsers.get(String(to));
+    if (activeCalls.has(String(to))) return socket.emit("call-busy");
     if (targetSocket) {
       io.to(targetSocket).emit("incoming-call", { from, type });
     } else {
@@ -391,12 +343,11 @@ io.on("connection", (socket) => {
   });
 
   socket.on("accept-call", ({ to }) => {
-    const from = String(socket.userId);
     const targetId = String(to);
-    activeCalls.set(from, targetId);
-    activeCalls.set(targetId, from);
+    activeCalls.set(String(socket.userId), targetId);
+    activeCalls.set(targetId, String(socket.userId));
     const callerSocket = onlineUsers.get(targetId);
-    if (callerSocket) io.to(callerSocket).emit("call-accepted", { from });
+    if (callerSocket) io.to(callerSocket).emit("call-accepted", { from: socket.userId });
   });
 
   socket.on("reject-call", ({ to }) => {
@@ -440,10 +391,9 @@ io.on("connection", (socket) => {
       activeCalls.delete(userId);
       const lastSeenDate = new Date();
       await User.findByIdAndUpdate(userId, { lastSeen: lastSeenDate });
-      io.emit("user-status", { userId, status: "offline", lastSeen: lastSeenDate });
+      io.emit("userStatusChange", { userId, status: "offline", lastSeen: lastSeenDate });
       io.emit("updateOnlineUsers", Array.from(onlineUsers.keys()));
     }
-    console.log("User disconnected:", socket.id);
   });
 });
 
