@@ -36,6 +36,19 @@ router.get("/:id", authMiddleware, async (req, res) => {
   }
 });
 
-
+router.put("/update-profile", authMiddleware, async (req, res) => {
+  try {
+    const { bio, avatar } = req.body;
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { $set: { bio, avatar } },
+      { new: true }
+    ).select("-password");
+    
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ message: "Update failed" });
+  }
+});
 
 export default router;

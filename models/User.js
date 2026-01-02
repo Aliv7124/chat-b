@@ -6,6 +6,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     avatar: { type: String, default: "" },
+    bio: { type: String, default: "Hey there! I'm using this chat." }, // Added Bio
     isOnline: { type: Boolean, default: false },
     lastSeen: { type: Date, default: Date.now },
   },
