@@ -189,7 +189,9 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 */
 
-   
+
+
+
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -238,13 +240,14 @@ mongoose
   .then(async () => {
     console.log("✅ MongoDB Connected");
 
-    // --- ADD THIS TEMPORARILY TO FIX PREVIOUS MESSAGES ---
+    // Fix legacy messages without status or stuck in 'sent'
     const result = await Message.updateMany(
-      { status: { $ne: "seen" } }, // Find messages that are NOT 'seen'
-      { $set: { status: "seen" } }   // Force them to 'seen'
+      { status: { $ne: "seen" } }, 
+      { $set: { status: "seen" } } 
     );
-    console.log(`Updated ${result.modifiedCount} old messages to 'seen' status.`);
-    // ---------------------------------------------------
+    if(result.modifiedCount > 0) {
+        console.log(`🧹 Cleaned up ${result.modifiedCount} old messages to 'seen' status.`);
+    }
   })
   .catch((err) => console.error("❌ MongoDB Error:", err));
 
@@ -258,7 +261,7 @@ io.on("connection", (socket) => {
   // ===== 1. USER PRESENCE =====
   socket.on("user-online", async (userId) => {
     if (!userId) return;
-    const stringId = String(userId); // Ensure ID is a string for the Map
+    const stringId = String(userId);
     socket.userId = stringId;
     onlineUsers.set(stringId, socket.id);
     
@@ -277,50 +280,52 @@ io.on("connection", (socket) => {
     socket.join(roomId);
   });
 
-  // ===== 3. CHAT MESSAGING (WITH TICK LOGIC) =====
+  // ===== 3. CHAT MESSAGING =====
   socket.on("sendMessage", async (message) => {
     const roomId = [String(message.sender), String(message.receiver)].sort().join("_");
     const receiverId = String(message.receiver);
     const targetSocket = onlineUsers.get(receiverId);
 
-    let updatedStatus = "sent"; // Default: Single Tick
+    let updatedStatus = "sent";
 
     if (targetSocket) {
-      // If receiver is online, update to 'delivered' (Double Tick)
+      // Receiver is online -> Double Tick (delivered)
       updatedStatus = "delivered";
       try {
         await Message.findByIdAndUpdate(message._id, { status: "delivered" });
       } catch (err) {
-        console.error("Error updating message status:", err);
+        console.error("Error updating status to delivered:", err);
       }
       
-      // Send to receiver immediately
+      // Emit to receiver
       io.to(targetSocket).emit("receiveMessage", { ...message, status: "delivered" });
     }
 
-    // Emit back to sender so their UI updates to Double Tick
+    // Emit back to sender
     socket.emit("message-status-updated", { 
       messageId: message._id, 
       status: updatedStatus 
     });
     
-    // Broadcast to the room (other instances/tabs of the users)
+    // Broadcast to other devices of the same user in that room
     socket.to(roomId).emit("receiveMessage", { ...message, status: updatedStatus });
   });
 
-  // ===== 4. BLUE TICK LOGIC (MARK AS SEEN) =====
+  // ===== 4. MARK AS SEEN (BLUE/CYAN TICK LOGIC) =====
   socket.on("mark-as-seen", async ({ messageIds, senderId, userId }) => {
     try {
+      // Update DB
       await Message.updateMany(
         { _id: { $in: messageIds } },
         { $set: { status: "seen" } }
       );
 
+      // Find the person who SENT the messages (the one who needs to see blue ticks)
       const senderSocket = onlineUsers.get(String(senderId));
       if (senderSocket) {
         io.to(senderSocket).emit("messages-seen-update", { 
           messageIds, 
-          receiverId: String(userId) 
+          receiverId: String(userId) // The person who "saw" the messages
         });
       }
     } catch (err) {
@@ -337,7 +342,7 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("messageDeleted", { messageId });
   });
 
-  // ===== 6. CALL SYSTEM & WEBRTC =====
+  // ===== 6. CALL SYSTEM =====
   socket.on("call-user", ({ from, to, type }) => {
     if (activeCalls.has(String(to))) {
       socket.emit("call-busy");
